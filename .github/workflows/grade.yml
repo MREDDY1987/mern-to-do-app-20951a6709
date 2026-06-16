@@ -1,0 +1,91 @@
+name: Grade Project
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    env:
+      # Future-proof: silence the Node 20 action deprecation; run actions on Node 24.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Install deps
+        continue-on-error: true
+        run: npm ci || npm install || true
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: npm run build --if-present
+      - name: Test
+        continue-on-error: true
+        run: npm test -- --ci --json --outputFile=jest-results.json || true
+      - name: Report to LMS
+        if: always()
+        continue-on-error: true
+        env:
+          MPOWER_WEBHOOK_URL:    ${{ vars.MPOWER_WEBHOOK_URL }}
+          MPOWER_TENANT_ID:      ${{ vars.MPOWER_TENANT_ID }}
+          MPOWER_ASSIGNMENT_ID:  ${{ vars.MPOWER_ASSIGNMENT_ID }}
+          MPOWER_STUDENT_ID:     ${{ vars.MPOWER_STUDENT_ID }}
+          MPOWER_WEBHOOK_SECRET: ${{ secrets.PROJECT_LABS_WEBHOOK_SECRET }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          REPO_FULL: ${{ github.repository }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          cat > grade-report.mjs <<'REPORTEOF'
+          import crypto from 'crypto';
+          import fs from 'fs';
+          const E = process.env;
+          if (!E.MPOWER_STUDENT_ID || !E.MPOWER_WEBHOOK_URL) {
+            console.log('Grader not configured (missing student id / webhook url) - skipping.');
+            process.exit(0);
+          }
+          let testsPassed = 0, testsTotal = 0, hasTests = false;
+          try {
+            const r = JSON.parse(fs.readFileSync('jest-results.json', 'utf8'));
+            testsPassed = r.numPassedTests || 0;
+            testsTotal = r.numTotalTests || 0;
+            hasTests = testsTotal > 0;
+          } catch {}
+          const buildStatus = E.BUILD_OUTCOME === 'success' ? 'SUCCESS' : 'FAILURE';
+          // With tests: score is the pass ratio. Without tests: grade on the build
+          // so a working app is not reported as a flat 0. Adjust this policy here.
+          let score, status;
+          if (hasTests) {
+            score = Math.round((testsPassed / testsTotal) * 100);
+            status = (testsPassed === testsTotal && buildStatus === 'SUCCESS') ? 'passed' : 'failed';
+          } else {
+            score = buildStatus === 'SUCCESS' ? 100 : 0;
+            status = buildStatus === 'SUCCESS' ? 'passed' : 'error';
+          }
+          const ts = Math.floor(Date.now() / 1000).toString();
+          const msg = [ts, E.MPOWER_TENANT_ID, E.MPOWER_ASSIGNMENT_ID, E.MPOWER_STUDENT_ID, E.COMMIT_SHA, String(score)].join('.');
+          const sig = crypto.createHmac('sha256', E.MPOWER_WEBHOOK_SECRET || '').update(msg).digest('hex');
+          try {
+            const res = await fetch(E.MPOWER_WEBHOOK_URL + '/project-labs/webhook/results', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'x-mpower-timestamp': ts, 'x-mpower-signature': sig },
+              body: JSON.stringify({
+                tenantId: E.MPOWER_TENANT_ID, assignmentId: E.MPOWER_ASSIGNMENT_ID, studentId: E.MPOWER_STUDENT_ID,
+                repoUrl: E.REPO_URL, repoFullName: E.REPO_FULL, commitSha: E.COMMIT_SHA,
+                commitMessage: (E.COMMIT_MSG || '').slice(0, 200), branch: E.BRANCH,
+                status, score, testsPassed, testsTotal, buildStatus,
+                logsUrl: E.REPO_URL + '/actions/runs/' + E.RUN_ID, githubRunId: E.RUN_ID,
+              }),
+            });
+            console.log('LMS:', res.status, await res.text());
+          } catch (err) {
+            console.log('LMS report failed:', err && err.message ? err.message : err);
+          }
+          REPORTEOF
+          node grade-report.mjs
